@@ -31,7 +31,7 @@
 - `api.firecrawl.dev`
 - `mcp.higgsfield.ai` (وغالباً نطاقات تسجيل الدخول التابعة لـ Higgsfield، ما قدرت أتأكد منها)
 
-الـ browsers (Playwright وChrome DevTools) يمروا بنفس الـ proxy، يعني بس يفتحوا مواقع نطاقاتها مسموحة. جربت: `github.com` انفتح بالاثنين، و`example.com` انرفض (`ERR_TUNNEL_CONNECTION_FAILED`). لو بدك تفحص موقع معين، أضف نطاقه بنفس الطريقة.
+الـ browsers (Playwright وChrome DevTools) يمروا بنفس الـ proxy، يعني بس يفتحوا مواقع نطاقاتها مسموحة. جربت: `github.com` انفتح بالاثنين، و`example.com` انرفض (`ERR_TUNNEL_CONNECTION_FAILED`). لو بدك تفحص موقع معين، أضف نطاقه بنفس الطريقة، **مع نطاقات الـ CDN والـ assets التابعة له**. مثال: `github.com` انفتح لكن `github.githubassets.com` انرفض، فملفات JS ما تحمّلت (أكثر من 100 خطأ `ERR_TUNNEL_CONNECTION_FAILED`)، وبهالحالة نتائج Lighthouse ما تعبّر عن جودة الموقع الحقيقية.
 
 **4. Higgsfield.** حسب صفحتهم الرسمية: اشتراك مدفوع، وفي Claude تضيفه كـ custom connector بالعنوان `https://mcp.higgsfield.ai/mcp` من <https://claude.ai/customize/connectors> (تسجيل الدخول OAuth بنافذة منهم). لمستخدمي Claude Code الصفحة نفسها بتوصي بأداة سطر الأوامر تبعتهم (Higgsfield CLI) بدل الـ MCP. ما قدرت أفتح صفحتهم مباشرة، فتأكد من الخطوات الحالية عندهم قبل الاعتماد عليها.
 
