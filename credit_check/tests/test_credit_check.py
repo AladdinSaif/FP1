@@ -13,8 +13,8 @@ TODAY = date(2026, 11, 3)
 
 def run(**kw):
     customers, invoices, _ = cc.load(SAMPLE / "customers.csv", SAMPLE / "invoices.csv")
-    return {n: cc.evaluate(customers[n], invoices[n], TODAY, kw.get("grace", 0), 0.8, kw.get("order"))
-            for n in customers}
+    policy = cc.Policy(grace_days=kw.get("grace", 0), suspend_days=kw.get("suspend", 0))
+    return {n: cc.evaluate(customers[n], invoices[n], TODAY, policy, kw.get("order")) for n in customers}
 
 
 class CreditCheckTest(unittest.TestCase):
@@ -50,8 +50,36 @@ class CreditCheckTest(unittest.TestCase):
     def test_order_bigger_than_available(self):
         customers, invoices, _ = cc.load(SAMPLE / "customers.csv", SAMPLE / "invoices.csv")
         n = "مطعم الريحان"
-        self.assertTrue(cc.evaluate(customers[n], invoices[n], TODAY, 0, 0.8, 5000).order_ok)
-        self.assertFalse(cc.evaluate(customers[n], invoices[n], TODAY, 0, 0.8, 6000).order_ok)
+        self.assertTrue(cc.evaluate(customers[n], invoices[n], TODAY, cc.Policy(), 5000).order_ok)
+        self.assertFalse(cc.evaluate(customers[n], invoices[n], TODAY, cc.Policy(), 6000).order_ok)
+
+    def test_short_delay_within_suspend_days_only_warns(self):
+        # 24 days late, suspension after 30 -> still allowed, flagged
+        r = run(suspend=30)["كافيه لاتيه"]
+        self.assertEqual(r.status, cc.STATUS_WARN)
+        self.assertEqual(r.overdue_amount, 1200)
+
+    def test_unapplied_payment_offsets_oldest_overdue(self):
+        c = {"name": "x", "credit_limit": 5000, "payment_days": 15}
+        inv = [cc.Invoice("A", None, date(2026, 9, 1), 1000), cc.Invoice("B", None, date(2026, 10, 25), 500),
+               cc.Invoice("PAY", None, None, -1000)]
+        r = cc.evaluate(c, inv, TODAY, cc.Policy(suspend_days=30))
+        self.assertEqual(r.balance, 500)
+        self.assertEqual(r.overdue_amount, 500)
+        self.assertEqual(r.max_days_overdue, 9)
+        self.assertEqual(r.status, cc.STATUS_WARN)
+
+    def test_cash_customer_tolerance(self):
+        c = {"name": "x", "credit_limit": 0, "payment_days": 0}
+        inv = [cc.Invoice("A", None, date(2026, 10, 30), 300)]
+        self.assertEqual(cc.evaluate(c, inv, TODAY).status, cc.STATUS_BLOCK)
+        self.assertEqual(cc.evaluate(dict(c, cash_tol_amount=500), inv, TODAY).status, cc.STATUS_CASH)
+        self.assertEqual(cc.evaluate(c, inv, TODAY, cc.Policy(cash_tol_days=7)).status, cc.STATUS_CASH)
+
+    def test_rounding_residuals_ignored(self):
+        c = {"name": "x", "credit_limit": 0, "payment_days": 0}
+        inv = [cc.Invoice("A", None, date(2026, 9, 1), 0.4)]
+        self.assertEqual(cc.evaluate(c, inv, TODAY).status, cc.STATUS_CASH)
 
     def test_payment_terms_parsing(self):
         self.assertEqual(cc.parse_payment_days("30 Days"), 30)

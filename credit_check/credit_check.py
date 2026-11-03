@@ -5,12 +5,18 @@
   1) العملاء: الاسم، الحد الائتماني، أيام السداد (شرط الدفع)
   2) الفواتير المفتوحة: العميل، تاريخ الفاتورة، تاريخ الاستحقاق، المبلغ المتبقي
 
-القواعد (قابلة للتعديل من سطر الأوامر):
-  - ممنوع: عنده فاتورة متأخرة عن تاريخ استحقاقها أكثر من مهلة السماح،
-           أو رصيده المفتوح وصل الحد الائتماني أو تجاوزه.
-  - كاش فقط: حده الائتماني صفر (أو فاضي) وما عليه شي متأخر.
-  - انتبه: مسموح بس استهلك نسبة عالية من حده (افتراضياً 80%).
-  - مسموح: غير ذلك، ويطلع المتاح له = الحد - الرصيد.
+أو يسحب نفس البيانات مباشرة من أودو (--odoo، انظر odoo_source.py).
+
+القواعد (قابلة للتعديل من سطر الأوامر، وبوضع أودو تنقرأ من إعدادات الشركة):
+  - "متأخر" = فاتورة عدّى تاريخ استحقاقها بأكثر من مهلة السماح (--grace-days).
+    الدفعات والإشعارات الدائنة غير المسوّاة تنخصم من أقدم الفواتير المتأخرة.
+  - عميل آجل (حد > 0):
+      ممنوع: متأخر أكثر من --suspend-days يوم، أو رصيده وصل الحد أو تجاوزه.
+      انتبه: عليه متأخر (ضمن --suspend-days)، أو استهلك 80% أو أكثر من حده.
+      مسموح: غير ذلك، والمتاح = الحد - الرصيد.
+  - عميل كاش (حد = 0):
+      ممنوع: عليه متأخر أكثر من مبلغ التسامح وأقدمه أكثر من أيام التسامح.
+      كاش فقط: غير ذلك (البيع بالدفع عند الاستلام).
 """
 from __future__ import annotations
 
@@ -146,6 +152,16 @@ class Invoice:
 
 
 @dataclass
+class Policy:
+    grace_days: int = 0          # تأخير ضمن هالمهلة ما بينحسب متأخر أصلاً
+    suspend_days: int = 0        # عميل آجل متأخر أكثر من هيك = ممنوع
+    warn_usage: float = 0.8      # نسبة استهلاك الحد للتنبيه
+    cash_tol_amount: float = 0.0  # عميل كاش: مبلغ متأخر مسموح
+    cash_tol_days: int = 0        # عميل كاش: أيام تأخير مسموحة
+    min_amount: float = 1.0       # مبالغ أقل من هيك (فروقات تقريب) بتنتجاهل
+
+
+@dataclass
 class Result:
     name: str
     credit_limit: float
@@ -160,50 +176,77 @@ class Result:
     reasons: list[str] = field(default_factory=list)
     order_amount: float | None = None
     order_ok: bool | None = None
+    other_balance: float | None = None
+    other_max_days: int = 0
 
 
-def evaluate(customer: dict, invoices: list[Invoice], today: date, grace_days: int, warn_usage: float,
-             order_amount: float | None = None) -> Result:
-    r = Result(customer["name"], customer["credit_limit"], customer["payment_days"])
+def overdue_summary(invoices: list[Invoice], payment_days: int, today: date, policy: Policy):
+    """يرجع (الرصيد، المبلغ المتأخر، أقصى أيام تأخير، رقم أقدم فاتورة متأخرة)."""
+    balance = sum(i.amount_due for i in invoices)
+    unapplied = -sum(i.amount_due for i in invoices if i.amount_due < 0)
+    late = []
     for inv in invoices:
-        if inv.amount_due <= 0.005:
+        if inv.amount_due < policy.min_amount:
             continue
-        r.balance += inv.amount_due
         due = inv.due_date
         if due is None and inv.invoice_date is not None:
-            due = inv.invoice_date + timedelta(days=r.payment_days)
+            due = inv.invoice_date + timedelta(days=payment_days)
         if due is None:
             continue
-        late = (today - due).days
-        if late > grace_days:
-            r.overdue_amount += inv.amount_due
-            if late > r.max_days_overdue:
-                r.max_days_overdue = late
-                r.oldest_overdue = inv.number
-    r.balance = round(r.balance, 2)
-    r.overdue_amount = round(r.overdue_amount, 2)
+        days = (today - due).days
+        if days > policy.grace_days:
+            late.append((days, inv))
+    late.sort(key=lambda t: -t[0])  # الأقدم أولاً: الدفعات غير المسوّاة بتسكّره قبل غيره
+    amount, max_days, oldest = 0.0, 0, ""
+    for days, inv in late:
+        used = min(unapplied, inv.amount_due)
+        unapplied -= used
+        left = inv.amount_due - used
+        if left >= policy.min_amount:
+            amount += left
+            if days > max_days:
+                max_days, oldest = days, inv.number
+    return round(balance, 2), round(amount, 2), max_days, oldest
+
+
+def evaluate(customer: dict, invoices: list[Invoice], today: date, policy: Policy | None = None,
+             order_amount: float | None = None) -> Result:
+    policy = policy or Policy()
+    r = Result(customer["name"], customer["credit_limit"], customer["payment_days"])
+    r.balance, r.overdue_amount, r.max_days_overdue, r.oldest_overdue = overdue_summary(
+        invoices, r.payment_days, today, policy)
     r.available = round(max(r.credit_limit - r.balance, 0.0), 2)
     if r.credit_limit > 0:
         r.usage_pct = round(r.balance / r.credit_limit * 100, 1)
+    late_text = (
+        f"متأخر {r.max_days_overdue} يوم عن الاستحقاق، مبلغ متأخر {r.overdue_amount:,.2f}"
+        + (f" (أقدم فاتورة {r.oldest_overdue})" if r.oldest_overdue else "")
+    )
 
-    if r.overdue_amount > 0:
-        r.reasons.append(
-            f"متأخر {r.max_days_overdue} يوم عن الاستحقاق، مبلغ متأخر {r.overdue_amount:,.2f}"
-            + (f" (أقدم فاتورة {r.oldest_overdue})" if r.oldest_overdue else "")
-        )
-    if r.credit_limit > 0 and r.balance >= r.credit_limit:
-        r.reasons.append(f"الرصيد {r.balance:,.2f} وصل/تجاوز الحد {r.credit_limit:,.2f}")
-
-    if r.reasons:
-        r.status = STATUS_BLOCK
-    elif r.credit_limit <= 0:
-        r.status = STATUS_CASH
-        r.reasons.append("ما له حد ائتماني، البيع نقداً فقط")
-    elif r.usage_pct is not None and r.usage_pct >= warn_usage * 100:
-        r.status = STATUS_WARN
-        r.reasons.append(f"مستهلك {r.usage_pct}% من حده، المتاح {r.available:,.2f}")
+    if r.credit_limit > 0:
+        if r.overdue_amount > 0 and r.max_days_overdue > policy.suspend_days:
+            r.reasons.append(late_text)
+        if r.balance >= r.credit_limit:
+            r.reasons.append(f"الرصيد {r.balance:,.2f} وصل/تجاوز الحد {r.credit_limit:,.2f}")
+        if r.reasons:
+            r.status = STATUS_BLOCK
+        elif r.overdue_amount > 0:
+            r.status = STATUS_WARN
+            r.reasons.append(late_text + f"، المتاح {r.available:,.2f}")
+        elif r.usage_pct >= policy.warn_usage * 100:
+            r.status = STATUS_WARN
+            r.reasons.append(f"مستهلك {r.usage_pct}% من حده، المتاح {r.available:,.2f}")
+        else:
+            r.reasons.append(f"المتاح {r.available:,.2f}")
     else:
-        r.reasons.append(f"المتاح {r.available:,.2f}")
+        tol_amount = customer.get("cash_tol_amount", policy.cash_tol_amount)
+        tol_days = customer.get("cash_tol_days", policy.cash_tol_days)
+        if r.overdue_amount > tol_amount and r.max_days_overdue > tol_days:
+            r.status = STATUS_BLOCK
+            r.reasons.append("عميل كاش وعليه فواتير غير مدفوعة: " + late_text)
+        else:
+            r.status = STATUS_CASH
+            r.reasons.append("ما له حد ائتماني، البيع نقداً فقط")
 
     if order_amount is not None:
         r.order_amount = order_amount
@@ -257,6 +300,10 @@ def write_report(results: list[Result], path: Path):
     rows = [[r.status, r.name, r.credit_limit, r.payment_days, r.balance, r.available,
              "" if r.usage_pct is None else r.usage_pct, r.overdue_amount, r.max_days_overdue,
              " | ".join(r.reasons)] for r in results]
+    if any(r.other_balance is not None for r in results):
+        headers += ["رصيد الشركة الثانية (للعلم)", "تأخيره (يوم)"]
+        for row, r in zip(rows, results):
+            row += [round(r.other_balance or 0.0, 2), r.other_max_days]
     if path.suffix.lower() == ".xlsx":
         import openpyxl
         from openpyxl.styles import Font, PatternFill
@@ -271,7 +318,7 @@ def write_report(results: list[Result], path: Path):
         for row in rows:
             ws.append(row)
             ws.cell(ws.max_row, 1).fill = PatternFill("solid", fgColor=fills[row[0]])
-        for col, w in zip("ABCDEFGHIJ", (10, 30, 14, 11, 14, 14, 14, 14, 14, 70)):
+        for col, w in zip("ABCDEFGHIJKL", (10, 40, 14, 11, 14, 14, 14, 14, 14, 70, 16, 12)):
             ws.column_dimensions[col].width = w
         ws.freeze_panes = "A2"
         wb.save(path)
@@ -284,31 +331,69 @@ def write_report(results: list[Result], path: Path):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description="فحص ائتمان عملاء المخبز")
-    p.add_argument("--customers", required=True, type=Path, help="ملف العملاء (csv/xlsx)")
-    p.add_argument("--invoices", type=Path, help="ملف الفواتير المفتوحة (csv/xlsx)")
+    src = p.add_argument_group("مصدر البيانات (ملفات أو أودو)")
+    src.add_argument("--customers", type=Path, help="ملف العملاء (csv/xlsx)")
+    src.add_argument("--invoices", type=Path, help="ملف الفواتير المفتوحة (csv/xlsx)")
+    src.add_argument("--odoo", action="store_true",
+                     help="اسحب مباشرة من أودو (يحتاج ODOO_API_KEY، واختيارياً ODOO_URL و ODOO_DB)")
+    src.add_argument("--company", type=int, help="أودو: رقم الشركة (افتراضي: شركة المستخدم الحالية)")
+    src.add_argument("--other-company", type=int,
+                     help="أودو: شركة ثانية يظهر رصيدها للعلم بس، ما بيأثر عالقرار (مثلاً الشركة القديمة 3)")
+    src.add_argument("--exclude", help="أودو: تجاهل العملاء اللي اسمهم يطابق هالنمط (regex)، مثلاً '^ZZ TEST'")
     p.add_argument("--today", help="تاريخ الفحص YYYY-MM-DD (افتراضي: اليوم)")
     p.add_argument("--grace-days", type=int, default=0, help="مهلة سماح بعد الاستحقاق بالأيام (افتراضي 0)")
+    p.add_argument("--suspend-days", type=int,
+                   help="عميل آجل متأخر أكثر من هيك يوم = ممنوع (افتراضي: 0، وبأودو من إعداد الشركة)")
     p.add_argument("--warn-usage", type=float, default=0.8, help="نسبة استهلاك الحد للتنبيه (افتراضي 0.8)")
     p.add_argument("--customer", help="افحص عميل واحد بالاسم (جزء من الاسم يكفي)")
     p.add_argument("--order", type=float, help="قيمة طلب جديد للتأكد إذا يمشي (مع --customer)")
     p.add_argument("--out", type=Path, help="احفظ التقرير (csv أو xlsx)")
     a = p.parse_args(argv)
+    if bool(a.odoo) == bool(a.customers):
+        p.error("حدد مصدر واحد: --customers (مع --invoices) أو --odoo")
 
     today = parse_date(a.today) if a.today else date.today()
-    customers, invoices, unknown = load(a.customers, a.invoices)
+    policy = Policy(grace_days=a.grace_days, suspend_days=a.suspend_days or 0, warn_usage=a.warn_usage)
+    other: dict[str, tuple[float, int]] = {}
+    unknown: set[str] = set()
+    if a.odoo:
+        from odoo_source import OdooClient, company_policy, default_company, load_from_odoo
+        client = OdooClient()
+        company = a.company or default_company(client)
+        cp = company_policy(client, company)
+        if a.suspend_days is None and cp["suspend_days"] is not None:
+            policy.suspend_days = int(cp["suspend_days"])
+        if cp["cash_tol_amount"] is not None:
+            policy.cash_tol_amount = float(cp["cash_tol_amount"])
+        if cp["cash_tol_days"] is not None:
+            policy.cash_tol_days = int(cp["cash_tol_days"])
+        print(f"أودو: {client.url}، الشركة {cp['name']} ({company})")
+        customers, invoices, other = load_from_odoo(client, company, a.other_company, a.exclude, today)
+    else:
+        customers, invoices, unknown = load(a.customers, a.invoices)
 
     names = list(customers)
     if a.customer:
         names = [n for n in names if _norm(a.customer) in _norm(n)]
         if not names:
             sys.exit(f"ما لقيت عميل اسمه يحتوي: {a.customer}")
-    results = [evaluate(customers[n], invoices.get(n, []), today, a.grace_days, a.warn_usage,
-                        a.order if a.customer else None) for n in names]
+    results = []
+    for n in names:
+        r = evaluate(customers[n], invoices.get(n, []), today, policy, a.order if a.customer else None)
+        if n in other:
+            r.other_balance, r.other_max_days = round(other[n][0], 2), other[n][1]
+        elif other:
+            r.other_balance = 0.0
+        results.append(r)
     results.sort(key=lambda r: (STATUS_ORDER[r.status], -r.max_days_overdue, -r.balance))
 
-    print(f"فحص الائتمان بتاريخ {today.isoformat()}  (مهلة السماح {a.grace_days} يوم)\n")
+    print(f"فحص الائتمان بتاريخ {today.isoformat()}  (مهلة السماح {policy.grace_days} يوم، "
+          f"إيقاف الآجل بعد {policy.suspend_days} يوم، تسامح الكاش {policy.cash_tol_amount:,.0f} / "
+          f"{policy.cash_tol_days} يوم)\n")
     for r in results:
         line = f"[{r.status}] {r.name}: " + " | ".join(r.reasons)
+        if r.other_balance and abs(r.other_balance) >= 1:
+            line += f" | رصيد الشركة الثانية {r.other_balance:,.2f}"
         if r.order_amount is not None:
             line += f"\n    ← الطلب {r.order_amount:,.2f}: " + ("يمشي ✅" if r.order_ok else "لا يمشي ❌")
         print(line)
